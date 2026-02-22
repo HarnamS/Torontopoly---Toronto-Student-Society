@@ -63,6 +63,8 @@ def theme(color, dark_mode):
 class DiceType(Enum):
     REGULAR = "Regular Dice"
     STABLE = "Stable Dice (3s & 4s)"
+    CHANCE = "Chance Dice (1,1,1,4,5,6)"
+    BAZINGA = "Bazinga Dice (1,2,3,3,4,4)"
     HIGH_EXPLOSIVE = "High Explosives!!"
     pass
 
@@ -245,17 +247,27 @@ class Property:
 # Player Class
 class Player:
     def __init__(self, name, color, token):
+        # Core identity/state
         self.name = name
         self.color = color
         self.token = token
+
+        # Economy + ownership state
         self.position = 0
         self.money = 500
         self.properties = []
+
+        # Jail / turn-modifier state
         self.in_jail = False
         self.jail_turns = 0
         self.consecutive_doubles = 0
         self.get_out_of_jail_free = 0
         self.next_roll_max_one = False
+
+        # Bazinga safety-net charges: when cash is <= 0 and Bazinga dice is active,
+        # this player can be rescued by +$200 up to 3 times.
+        self.bazinga_rescues_left = 3
+
         # Animation state for smooth/hopping movement
         self.animating = False
         self.anim_path = []        # list of position indices to traverse (in order)
@@ -284,20 +296,36 @@ class Player:
 # Dice Class
 class Dice:
     def __init__(self):
+        # Active dice variant controls the probability model used in roll().
         self.dice_type = DiceType.REGULAR
         self.roll_result = (0, 0)
         self.double_count = 0
         
     def roll(self):
+        # Standard fair 1..6 dice
         if self.dice_type == DiceType.REGULAR:
             die1 = random.randint(1, 6)
             die2 = random.randint(1, 6)
             
+        # Mid-variance profile concentrated around 3 and 4
         elif self.dice_type == DiceType.STABLE:
             # Physical die: three 3-faces and three 4-faces
             die1 = random.choice([3, 3, 3, 4, 4, 4])
             die2 = random.choice([3, 3, 3, 4, 4, 4])
 
+        # Buff-leaning chance profile
+        elif self.dice_type == DiceType.CHANCE:
+            # Physical die: faces are 1,1,1,4,5,6
+            die1 = random.choice([1, 1, 1, 4, 5, 6])
+            die2 = random.choice([1, 1, 1, 4, 5, 6])
+
+        # Low-to-mid profile + bankruptcy protection synergy
+        elif self.dice_type == DiceType.BAZINGA:
+            # Physical die: faces are 1,2,3,3,4,4
+            die1 = random.choice([1, 2, 3, 3, 4, 4])
+            die2 = random.choice([1, 2, 3, 3, 4, 4])
+
+        # High-variance profile with extreme 1/6 faces only
         elif self.dice_type == DiceType.HIGH_EXPLOSIVE:
             # Physical die: three 1-faces and three 6-faces
             die1 = random.choice([1, 1, 1, 6, 6, 6])
@@ -668,10 +696,15 @@ class CanadaMonopoly:
         self.message_timer = duration
 
     def get_dice_total_distribution(self, dice_type):
+        # Per-face multiplicity model for each custom die variant.
         if dice_type == DiceType.REGULAR:
             weights = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
         elif dice_type == DiceType.STABLE:
             weights = {3: 3, 4: 3}
+        elif dice_type == DiceType.CHANCE:
+            weights = {1: 3, 4: 1, 5: 1, 6: 1}
+        elif dice_type == DiceType.BAZINGA:
+            weights = {1: 1, 2: 1, 3: 2, 4: 2}
         else:
             weights = {1: 3, 6: 3}
 
@@ -693,8 +726,13 @@ class CanadaMonopoly:
         return sum(((total - mean) ** 2) * prob for total, prob in distribution.items())
 
     def get_doubles_probability(self, dice_type):
+        # Doubles probabilities depend on repeated faces in each profile.
         if dice_type == DiceType.REGULAR:
             return 1 / 6
+        if dice_type == DiceType.CHANCE:
+            return 1 / 3
+        if dice_type == DiceType.BAZINGA:
+            return 5 / 18
         return 1 / 2
 
     def record_roll_stats(self, roll_value, is_double, landing_pos):
@@ -748,7 +786,30 @@ class CanadaMonopoly:
     # CHANCE / FATE CARD HANDLER
     # ─────────────────────────────────────────────────────────────────────────
     def handle_chance(self, player):
-        card = draw_chance_card()
+        if self.dice.dice_type == DiceType.CHANCE:
+            buff_actions = [
+                "canada_gold",
+                "bake_sale",
+                "jackpot",
+                "wheel_fortune",
+                "spare_money",
+                "party_money",
+                "coin_bag_chance",
+            ]
+            action = random.choice(buff_actions)
+            chance_dice_card_text = {
+                "canada_gold": ("Canada Wins Gold!", "Chance Dice boost: gain $100."),
+                "bake_sale": ("School Bake Sale", "Chance Dice boost: gain $10."),
+                "jackpot": ("Jackpot!", "Chance Dice boost: gain $200."),
+                "wheel_fortune": ("Wheel of Fortune", "Chance Dice boost: gain $50."),
+                "spare_money": ("Spare Change", "Chance Dice boost: collect $10 from each player."),
+                "party_money": ("Party Host", "Chance Dice boost: collect $25 from each player."),
+                "coin_bag_chance": ("Coin Bag", "Chance Dice boost: gain +10% money."),
+            }
+            name, description = chance_dice_card_text[action]
+            card = {"name": name, "description": description, "action": action}
+        else:
+            card = draw_chance_card()
         action = card["action"]
 
         # Show card name + description at the top
@@ -893,6 +954,9 @@ class CanadaMonopoly:
                 if player.pay(rent, prop.owner):
                     self.set_message(f"Paid ${rent} rent to {prop.owner.name}")
                 else:
+                    # Failed rent payment is treated as a bankruptcy event.
+                    # Set cash to 0 so Bazinga rescue logic can evaluate the <= 0 rule.
+                    player.money = 0
                     self.set_message(f"{player.name} can't pay rent! Bankruptcy!")
                     self.handle_bankruptcy(player)
         
@@ -921,6 +985,18 @@ class CanadaMonopoly:
                 self.set_message("Paid $100 Luxury Tax")
     
     def handle_bankruptcy(self, player):
+        # Bazinga bailout rule:
+        # If the player is out of cash (<= 0), and the CURRENT selected dice type
+        # is Bazinga, grant +$200 up to 3 times before true bankruptcy.
+        if player.money <= 0 and self.dice.dice_type == DiceType.BAZINGA and player.bazinga_rescues_left > 0:
+            player.bazinga_rescues_left -= 1
+            player.receive(200)
+            self.set_message(
+                f"Bazinga save! {player.name} gets +$200 "
+                f"({player.bazinga_rescues_left} save(s) left)."
+            )
+            return
+
         self.players.remove(player)
         if len(self.players) == 1:
             self.game_over = True
@@ -928,6 +1004,7 @@ class CanadaMonopoly:
             self.set_message(f"{self.players[0].name} wins!", 100000)
 
     def force_bankruptcy_if_needed(self):
+        # Safety net for any code path that accidentally drives a player below zero.
         if self.game_over or not self.players:
             return
         current_player = self.players[self.current_player_index]
@@ -1322,8 +1399,6 @@ class CanadaMonopoly:
         # Draw card deck in board center
         self.draw_center_card_deck()
 
-        self.draw_hover_tooltip(mouse_pos)
-
         txt_col = DM_TEXT if dm else BLACK
 
         info_x = self.info_x
@@ -1334,9 +1409,12 @@ class CanadaMonopoly:
         money_text = self.font.render(f"Money: ${current_player.money}", True, txt_col)
         self.screen.blit(money_text, (info_x, info_y + 40))
 
+        # Dice-type color coding helps players quickly identify active probability profile.
         dice_type_colors = {
             DiceType.REGULAR: SKY_BLUE,
             DiceType.STABLE: GREEN,
+            DiceType.CHANCE: ORANGE,
+            DiceType.BAZINGA: GOLD,
             DiceType.HIGH_EXPLOSIVE: RED,
         }
         dice_label_color = dice_type_colors.get(self.dice.dice_type, txt_col)
@@ -1365,8 +1443,6 @@ class CanadaMonopoly:
         pygame.draw.rect(self.screen, DM_BORDER if dm else BLACK, self.settings_button, 1, border_radius=6)
         gear_lbl = self.font.render("⚙ Settings", True, DM_TEXT if dm else CANADA_WHITE)
         self.screen.blit(gear_lbl, gear_lbl.get_rect(center=self.settings_button.center))
-        if self.settings_open:
-            self.draw_settings_panel()
 
         pygame.draw.rect(self.screen, CANADA_RED, self.roll_button)
         self.screen.blit(self.font.render("Roll Dice", True, CANADA_WHITE), (self.roll_button.x + 30, self.roll_button.y + 10))
@@ -1467,6 +1543,24 @@ class CanadaMonopoly:
                     "Totals: 6 (25%), 7 (50%), 8 (25%)",
                     "Expected total: 7",
                     "Doubles chance: 50%",
+                ]
+            elif self.dice.dice_type == DiceType.CHANCE:
+                dice_lines = [
+                    "Chance Dice Stats:",
+                    "Each die: 1,1,1,4,5,6",
+                    "Low-roll biased distribution",
+                    "Expected total: 6.00",
+                    "Doubles chance: 33.3%",
+                    "Chance tiles: buff-only outcomes",
+                ]
+            elif self.dice.dice_type == DiceType.BAZINGA:
+                dice_lines = [
+                    "Bazinga Dice Stats:",
+                    "Each die: 1,2,3,3,4,4",
+                    "Expected total: 5.67",
+                    "Doubles chance: 27.8%",
+                    "Bazinga rescue: +$200 up to 3x",
+                    "Rescue only works while Bazinga is active",
                 ]
             else:
                 dice_lines = [
@@ -1625,6 +1719,8 @@ class CanadaMonopoly:
             for i, line in enumerate(lines):
                 surf = self.font.render(line, True, tip_txt)
                 self.screen.blit(surf, (tooltip_x + padding, tooltip_y + padding + i * line_height))
+
+        self.draw_hover_tooltip(mouse_pos)
 
         # ── Hackathon Laptop UI ───────────────────────────────────────────────
         if self.hackathon_pending:
@@ -1813,6 +1909,9 @@ class CanadaMonopoly:
             self.screen.blit(self.font.render("+20",   True, CANADA_WHITE), (self.raise_20_button.x + 22,  self.raise_20_button.y + 8))
             self.screen.blit(self.font.render("+100",  True, CANADA_WHITE), (self.raise_100_button.x + 20, self.raise_100_button.y + 8))
             self.screen.blit(self.font.render("Leave", True, CANADA_WHITE), (self.leave_auction_button.x + 6, self.leave_auction_button.y + 8))
+
+        if self.settings_open:
+            self.draw_settings_panel()
     
     def draw_center_card_deck(self):
         """Draw an animated card deck with CHANCE label in the board center."""
